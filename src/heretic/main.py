@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
-# ruff: noqa: E402
-
 import sys
 
 # Ensure standard output/error use UTF-8 instead of system default charmap (e.g. cp1252 on Windows).
@@ -23,7 +21,7 @@ def _is_help_invocation() -> bool:
 
 # Parse and handle CLI help before importing heavyweight ML/runtime dependencies.
 if _is_help_invocation():
-    Settings()  # ty:ignore[missing-argument]
+    Settings()
 
 # FIXME: Rich progress bars are currently disabled because of rendering issues
 #        when used from multiple threads in parallel (e.g. by huggingface_hub).
@@ -39,13 +37,13 @@ import logging
 import math
 import os
 import random
+import re
 import time
 import warnings
-from dataclasses import asdict
 from importlib.metadata import version
 from os.path import commonprefix
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import huggingface_hub
 import lm_eval
@@ -53,7 +51,6 @@ import numpy as np
 import optuna
 import questionary
 import torch
-import torch.nn.functional as F
 import transformers
 from huggingface_hub import HfApi, ModelCard, ModelCardData
 from lm_eval.models.huggingface import HFLM
@@ -62,17 +59,23 @@ from optuna.exceptions import ExperimentalWarning
 from optuna.samplers import TPESampler
 from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
-from optuna.study import StudyDirection
-from optuna.trial import TrialState, create_trial
+from optuna.trial import FrozenTrial, TrialState, create_trial
 from pydantic import ValidationError
 from questionary import Choice, Style
+from rich.markup import escape
 from rich.table import Table
+from rich.text import Text
 from rich.traceback import install
 
-from .analyzer import Analyzer
-from .config import ExportStrategy, QuantizationMethod
+from .config import (
+    DatasetSpecification,
+    ExportStrategy,
+    QuantizationMethod,
+)
 from .evaluator import Evaluator
-from .model import AbliterationParameters, Model, get_model_class
+from .model import Model, get_model_class
+from .modifier import load_and_init_modifiers
+from .plugin import Context, is_builtin_plugin
 from .reproduce import (
     check_environment,
     collect_reproducibles,
@@ -81,11 +84,12 @@ from .reproduce import (
 from .system import empty_cache, get_accelerator_info
 from .utils import (
     ask_if_unset,
+    format_dataset_specification,
     format_duration,
     format_exception,
     get_file_sha256,
     get_readme_intro,
-    get_trial_parameters,
+    is_dataset_specification_reproducible,
     is_hf_path,
     load_prompts,
     print,
@@ -217,7 +221,7 @@ def run():
     try:
         # The required argument "model" must be provided by the user,
         # either on the command line or in the configuration file.
-        settings = Settings()  # ty:ignore[missing-argument]
+        settings = Settings()
     except ValidationError as error:
         print(f"[red]Configuration contains [bold]{error.error_count()}[/] errors:[/]")
 
@@ -243,12 +247,12 @@ def run():
         # FIXME: "Reproduction"/"reproducibility" name inconsistency!
         reproduction_information = load_reproduction_information(settings.reproduce)
 
-        if reproduction_information["version"] not in ["1", "2"]:
+        if reproduction_information["version"] != "4":
             print(
-                (
-                    f"[red]Unsupported file format version: [bold]{reproduction_information['version']}[/].[/] "
-                    "Try loading the file with a newer version of Heretic."
-                )
+                f"[red]Unsupported file format version: [bold]{reproduction_information['version']}[/].[/] "
+                "This version of Heretic reads version 4 (plugin-based) reproduce.json files. "
+                "Older files were produced before the introduction of the plugin system and are not supported. "
+                "Please install Heretic 1.4 to use these files."
             )
             return
 
@@ -256,8 +260,6 @@ def run():
             return
 
         print()
-
-        verify_hashes = reproduction_information["version"] != "1"
 
         settings = Settings.model_validate(reproduction_information["settings"])
 
@@ -333,12 +335,10 @@ def run():
             if settings.checkpoint_action is None:
                 print()
                 print(
-                    (
-                        "[green]You have already processed this model.[/] "
-                        "You can show the results from the previous run, allowing you to export models or to run additional trials. "
-                        "Alternatively, you can ignore the previous run and start from scratch. "
-                        "This will delete the checkpoint file and all results from the previous run."
-                    )
+                    "[green]You have already processed this model.[/] "
+                    "You can show the results from the previous run, allowing you to export models or to run additional trials. "
+                    "Alternatively, you can ignore the previous run and start from scratch. "
+                    "This will delete the checkpoint file and all results from the previous run."
                 )
 
             choices.append(
@@ -351,12 +351,10 @@ def run():
             if settings.checkpoint_action is None:
                 print()
                 print(
-                    (
-                        "[yellow]You have already processed this model, but the run was interrupted.[/] "
-                        "You can continue the previous run from where it stopped. This will override any specified settings. "
-                        "Alternatively, you can ignore the previous run and start from scratch. "
-                        "This will delete the checkpoint file and all results from the previous run."
-                    )
+                    "[yellow]You have already processed this model, but the run was interrupted.[/] "
+                    "You can continue the previous run from where it stopped. This will override any specified settings. "
+                    "Alternatively, you can ignore the previous run and start from scratch. "
+                    "This will delete the checkpoint file and all results from the previous run."
                 )
 
             choices.append(
@@ -408,17 +406,17 @@ def run():
     print()
     print_memory_usage()
 
-    print()
-    print(f"Loading good prompts from [bold]{settings.good_prompts.dataset}[/]...")
-    good_prompts = load_prompts(settings, settings.good_prompts)
-    print(f"* [bold]{len(good_prompts)}[/] prompts loaded")
-
-    print()
-    print(f"Loading bad prompts from [bold]{settings.bad_prompts.dataset}[/]...")
-    bad_prompts = load_prompts(settings, settings.bad_prompts)
-    print(f"* [bold]{len(bad_prompts)}[/] prompts loaded")
-
     if settings.batch_size == 0:
+        print()
+        print(
+            f"Loading batch size test prompts from [bold]{format_dataset_specification(settings.batch_size_test_prompts)}[/]..."
+        )
+        batch_size_test_prompts = load_prompts(
+            settings,
+            settings.batch_size_test_prompts,
+        )
+        print(f"* [bold]{len(batch_size_test_prompts)}[/] prompts loaded")
+
         print()
         print("Determining optimal batch size...")
 
@@ -429,7 +427,9 @@ def run():
         while batch_size <= settings.max_batch_size:
             print(f"* Trying batch size [bold]{batch_size}[/]... ", end="")
 
-            prompts = good_prompts * math.ceil(batch_size / len(good_prompts))
+            prompts = batch_size_test_prompts * math.ceil(
+                batch_size / len(batch_size_test_prompts)
+            )
             prompts = prompts[:batch_size]
 
             try:
@@ -471,42 +471,99 @@ def run():
 
     if settings.response_prefix is None:
         print()
+        print(
+            f"Loading response prefix test prompts from [bold]{format_dataset_specification(settings.response_prefix_test_prompts)}[/]..."
+        )
+        response_prefix_test_prompts = load_prompts(
+            settings,
+            settings.response_prefix_test_prompts,
+        )
+        print(f"* [bold]{len(response_prefix_test_prompts)}[/] prompts loaded")
+
+        print()
         print("Checking for common response prefix...")
-        prefix_check_prompts = good_prompts[:100] + bad_prompts[:100]
-        responses = model.get_responses_batched(prefix_check_prompts)
 
-        # Despite being located in os.path, commonprefix actually performs
-        # a naive string operation without any path-specific logic,
-        # which is exactly what we need here. Trailing spaces are removed
-        # to avoid issues where multiple different tokens that all start
-        # with a space character lead to the common prefix ending with
-        # a space, which would result in an uncommon tokenization.
-        settings.response_prefix = commonprefix(responses).rstrip(" ")
+        # Detect if the model's chat template inserts a reasoning tag on its own
+        # at the end of user's prompt (e.g. <think>) by using a dummy prompt.
+        # If found, then we use the full closed CoT as the response prefix.
+        # LiquidAI's LFM models do this (Lfm2ForCausalLM).
 
-        if settings.response_prefix:
-            print(f"* Prefix found: [bold]{settings.response_prefix!r}[/]")
+        # This cast is valid because str is the return type
+        # for a single chat operation with tokenize=False.
+        dummy_prompt = cast(
+            str,
+            model.tokenizer.apply_chat_template(
+                [{"role": "user", "content": "This is a dummy prompt."}],
+                add_generation_prompt=True,
+                tokenize=False,
+            ),
+        )
 
-            for cot_initializer, closed_cot_block in settings.chain_of_thought_skips:
-                if settings.response_prefix.startswith(cot_initializer):
-                    settings.response_prefix = closed_cot_block
-                    print(
-                        f"* Closed Chain-of-Thought block: [bold]{settings.response_prefix!r}[/]"
-                    )
+        cot_skip_applied = False
 
-                    # When using a Chain-of-Thought skip, we need to check that the prefix
-                    # is actually complete (e.g. not missing a trailing newline).
-                    print("* Rechecking with prefix...")
-                    responses = model.get_responses_batched(prefix_check_prompts)
-                    additional_prefix = commonprefix(responses).rstrip(" ")
-                    if additional_prefix:
-                        settings.response_prefix += additional_prefix
+        for cot_initializer, closed_cot_block in settings.chain_of_thought_skips:
+            # Match the tag and ignore any whitespace characters following it at the end
+            # (if any), including spaces, tabs, and linebreaks. This is required for models
+            # having whitespaces after the tags.
+            pattern = rf"{re.escape(cot_initializer)}\s*$"
+            match = re.search(pattern, dummy_prompt)
+
+            if match:
+                # We use only the closed CoT block here. Any whitespaces
+                # will be handled by the 'Rechecking with prefix' logic below.
+                settings.response_prefix = closed_cot_block
+                print(
+                    f"* Closed Chain-of-Thought block: [bold]{escape(repr(settings.response_prefix))}[/]"
+                )
+                cot_skip_applied = True
+                break
+
+        # Fallback to inference for models like mistral-3 which are specifically
+        # instructed to generate thinking tags using the system prompt in their
+        # chat template, instead of inserting a prefix tag (e.g. <think>) at
+        # the end of user prompt like the case above. We expect the model to
+        # generate those tags.
+        if settings.response_prefix is None:
+            responses = model.get_responses_batched(response_prefix_test_prompts)
+
+            # Despite being located in os.path, commonprefix actually performs
+            # a naive string operation without any path-specific logic,
+            # which is exactly what we need here. Trailing spaces are removed
+            # to avoid issues where multiple different tokens that all start
+            # with a space character lead to the common prefix ending with
+            # a space, which would result in an uncommon tokenization.
+            settings.response_prefix = commonprefix(responses).rstrip(" ")
+
+            if settings.response_prefix:
+                print(
+                    f"* Prefix found: [bold]{escape(repr(settings.response_prefix))}[/]"
+                )
+
+                for (
+                    cot_initializer,
+                    closed_cot_block,
+                ) in settings.chain_of_thought_skips:
+                    if settings.response_prefix.startswith(cot_initializer):
+                        settings.response_prefix = closed_cot_block
                         print(
-                            f"* Extended prefix found: [bold]{settings.response_prefix!r}[/]"
+                            f"* Closed Chain-of-Thought block: [bold]{escape(repr(settings.response_prefix))}[/]"
                         )
+                        cot_skip_applied = True
+                        break
+            else:
+                print("* None found")
 
-                    break
-        else:
-            print("* None found")
+        if cot_skip_applied:
+            # When using a Chain-of-Thought skip, we need to check that the prefix
+            # is actually complete (e.g. not missing a trailing newline).
+            print("* Rechecking with prefix...")
+            responses = model.get_responses_batched(response_prefix_test_prompts)
+            additional_prefix = commonprefix(responses).rstrip(" ")
+            if additional_prefix:
+                settings.response_prefix += additional_prefix
+                print(
+                    f"* Extended prefix found: [bold]{escape(repr(settings.response_prefix))}[/]"
+                )
 
     evaluator = Evaluator(settings, model)
 
@@ -516,159 +573,62 @@ def run():
         settings.model = settings.evaluate_model
         model.reset_model()
         print("* Evaluating...")
-        evaluator.get_score()
+        for name, score in evaluator.get_scores():
+            print(f"  * [bold]{name}:[/] [green]{score.rich_display}[/]")
+        return
+
+    if not reproduction_mode and not evaluator.get_objective_names():
+        print()
+        print(
+            "[red]No optimization objectives configured.[/] At least one scorer "
+            'must set [bold]optimization[/] to "maximize" or "minimize". '
+            "See [bold]config.default.toml[/] for details."
+        )
         return
 
     print()
-    print("Calculating per-layer refusal directions...")
+    print("Loading and initializing modifiers...")
+    modifier_entries = load_and_init_modifiers(settings, model)
 
-    needs_full_residuals = settings.print_residual_geometry or settings.plot_residuals
-
-    if needs_full_residuals:
-        print("* Obtaining residuals for good prompts...")
-        good_residuals = model.get_residuals_batched(good_prompts)
-        print("* Obtaining residuals for bad prompts...")
-        bad_residuals = model.get_residuals_batched(bad_prompts)
-
-        good_means = good_residuals.mean(dim=0)
-        bad_means = bad_residuals.mean(dim=0)
-
-        analyzer = Analyzer(settings, model, good_residuals, bad_residuals)
-
-        if settings.print_residual_geometry:
-            analyzer.print_residual_geometry()
-
-        if settings.plot_residuals:
-            analyzer.plot_residuals()
-
-        # We don't need the full residuals after computing their means and analyzing geometry.
-        del good_residuals, bad_residuals, analyzer
-    else:
-        print("* Obtaining residual mean for good prompts...")
-        good_means = model.get_residuals_mean(good_prompts)
-        print("* Obtaining residual mean for bad prompts...")
-        bad_means = model.get_residuals_mean(bad_prompts)
-
-    refusal_directions = F.normalize(bad_means - good_means, p=2, dim=1)
-
-    if settings.orthogonalize_direction:
-        # Implements https://huggingface.co/blog/grimjim/projected-abliteration
-        # Adjust the refusal directions so that only the component that is
-        # orthogonal to the good direction is subtracted during abliteration.
-        good_directions = F.normalize(good_means, p=2, dim=1)
-        projection_vector = torch.sum(refusal_directions * good_directions, dim=1)
-        refusal_directions = (
-            refusal_directions - projection_vector.unsqueeze(1) * good_directions
-        )
-        refusal_directions = F.normalize(refusal_directions, p=2, dim=1)
-        del good_directions, projection_vector
-
-    del good_means, bad_means
+    # `load_and_init_modifiers` currently guarantees that the returned list has exactly one element.
+    # This may change in the future when support for multiple modifiers is implemented.
+    modifier_entry = modifier_entries[0]
+    modifier = modifier_entry.modifier
+    modifier_name = modifier_entry.name
 
     # Clear cache before starting the optimization study.
-    # This should free up memory from the objects released with the del statements above.
+    # This should free up memory from temporary objects created while initializing modifiers.
     empty_cache()
 
     trial_index = 0
     start_index = 0
     start_time = time.perf_counter()
 
-    def objective(trial: Trial) -> tuple[float, float]:
+    def objective(trial: Trial) -> tuple[float, ...]:
         nonlocal trial_index
         trial_index += 1
         trial.set_user_attr("index", trial_index)
 
-        direction_scope = trial.suggest_categorical(
-            "direction_scope",
-            [
-                "global",
-                "per layer",
-            ],
-        )
-
-        last_layer_index = len(model.get_layers()) - 1
-
-        # Discrimination between "harmful" and "harmless" inputs is usually strongest
-        # in layers slightly past the midpoint of the layer stack. See the original
-        # abliteration paper (https://arxiv.org/abs/2406.11717) for a deeper analysis.
-        #
-        # Note that we always sample this parameter even though we only need it for
-        # the "global" direction scope. The reason is that multivariate TPE doesn't
-        # work with conditional or variable-range parameters.
-        direction_index = trial.suggest_float(
-            "direction_index",
-            0.4 * last_layer_index,
-            0.9 * last_layer_index,
-        )
-
-        if direction_scope == "per layer":
-            direction_index = None
-
-        parameters = {}
-
-        for component in model.get_abliterable_components():
-            # The parameter ranges are based on experiments with various models
-            # and much wider ranges. They are not set in stone and might have to be
-            # adjusted for future models.
-            #
-            # The MLP gets a negative lower bound that is then clamped to 0, so the
-            # optimizer can fully disable its ablation. The clamp puts a positive
-            # probability mass on exactly 0 (the continuous sampler would otherwise
-            # reach 0 with probability zero). Ablating the MLP is often unnecessary for
-            # removing refusals and tends to damage model intelligence more than
-            # ablating the attention output, so on many models the optimum is to leave
-            # it (mostly) untouched. See issue #202.
-            max_weight_lower_bound = -0.25 if component == "mlp.down_proj" else 0.8
-            max_weight = max(
-                0.0,
-                trial.suggest_float(
-                    f"{component}.max_weight",
-                    max_weight_lower_bound,
-                    1.5,
-                ),
-            )
-            max_weight_position = trial.suggest_float(
-                f"{component}.max_weight_position",
-                0.6 * last_layer_index,
-                1.0 * last_layer_index,
-            )
-            # For sampling purposes, min_weight is expressed as a fraction of max_weight,
-            # again because multivariate TPE doesn't support variable-range parameters.
-            # The value is transformed into the actual min_weight value below.
-            min_weight = trial.suggest_float(
-                f"{component}.min_weight",
-                0.0,
-                1.0,
-            )
-            min_weight_distance = trial.suggest_float(
-                f"{component}.min_weight_distance",
-                1.0,
-                max(0.6 * last_layer_index, 1.0),
-            )
-
-            parameters[component] = AbliterationParameters(
-                max_weight=max_weight,
-                max_weight_position=max_weight_position,
-                min_weight=(min_weight * max_weight),
-                min_weight_distance=min_weight_distance,
-            )
-
-        trial.set_user_attr("direction_index", direction_index)
-        trial.set_user_attr("parameters", {k: asdict(v) for k, v in parameters.items()})
+        ctx = Context(settings=settings, model=model)
+        parameters = modifier.suggest_parameters(ctx, trial)
+        trial.set_user_attr("parameters", parameters.to_dict())
 
         print()
         print(
-            f"Running trial [bold]{trial_index}[/] of [bold]{settings.n_trials}[/]..."
+            f"[magenta]Running trial [bold]{trial_index}[/] of [bold]{settings.n_trials}[/]...[/]"
         )
         print("* Parameters:")
-        for name, value in get_trial_parameters(trial).items():
+        for name, value in modifier.render_trial_parameters(trial).items():
             print(f"  * {name} = [bold]{value}[/]")
         print("* Resetting model...")
-        model.reset_model()
-        print("* Abliterating...")
-        model.abliterate(refusal_directions, direction_index, parameters)
+        modifier.reset_model(ctx)
+        print(f"* Modifying model using {modifier_name}...")
+        modifier.modify_model(ctx, parameters)
         print("* Evaluating...")
-        score, kl_divergence, refusals = evaluator.get_score()
+        scores = evaluator.get_scores()
+        objective_values = evaluator.get_objective_values(scores)
+        for name, score in scores:
+            print(f"  * [bold]{name}:[/] [green]{score.rich_display}[/]")
 
         elapsed_time = time.perf_counter() - start_time
         remaining_time = (elapsed_time / (trial_index - start_index)) * (
@@ -680,22 +640,25 @@ def run():
             print(
                 f"[grey50]Estimated remaining time: [bold]{format_duration(remaining_time)}[/][/]"
             )
+        trial.set_user_attr(
+            "scores",
+            evaluator.get_paired_score_records(scores),
+        )
         print_memory_usage()
 
-        trial.set_user_attr("kl_divergence", kl_divergence)
-        trial.set_user_attr("refusals", refusals)
-        trial.set_user_attr("base_refusals", evaluator.base_refusals)
-        trial.set_user_attr("n_bad_prompts", len(evaluator.bad_prompts))
+        return objective_values
 
-        return score
-
-    def objective_wrapper(trial: Trial) -> tuple[float, float]:
+    def objective_wrapper(trial: Trial) -> tuple[float, ...]:
         try:
             return objective(trial)
         except KeyboardInterrupt:
             # Stop the study gracefully on Ctrl+C.
             trial.study.stop()
             raise TrialPruned()
+
+    # Derive objective info from the configured scorers.
+    objective_names = evaluator.get_objective_names()
+    directions = evaluator.get_objective_directions()
 
     if not reproduction_mode:
         study = optuna.create_study(
@@ -705,8 +668,8 @@ def run():
                 multivariate=True,
                 seed=settings.seed,
             ),
-            directions=[StudyDirection.MINIMIZE, StudyDirection.MINIMIZE],
             storage=storage,
+            directions=directions,
             study_name="heretic",
             load_if_exists=True,
         )
@@ -746,34 +709,38 @@ def run():
             if not completed_trials:
                 raise KeyboardInterrupt
 
-            # Get the Pareto front of trials. We can't use study.best_trials directly
-            # as get_score() doesn't return the pure KL divergence and refusal count.
-            # Note: Unlike study.best_trials, this does not handle objective constraints.
+            # Best trials isn't sorted, so sort by all the scores in non-decreasing order.
             sorted_trials = sorted(
-                completed_trials,
-                key=lambda trial: (
-                    trial.user_attrs["refusals"],
-                    trial.user_attrs["kl_divergence"],
+                study.best_trials,
+                key=lambda trial: tuple(
+                    next(
+                        (
+                            score["score"]["value"]
+                            for score in trial.user_attrs["scores"]
+                            if score["name"] == name
+                        ),
+                        None,
+                    )
+                    for name in objective_names
                 ),
             )
-            min_divergence = math.inf
-            best_trials = []
-            for trial in sorted_trials:
-                kl_divergence = trial.user_attrs["kl_divergence"]
-                if kl_divergence < min_divergence:
-                    min_divergence = kl_divergence
-                    best_trials.append(trial)
+
+            def format_trial_title(trial: FrozenTrial) -> str:
+                prefix = f"[Trial {trial.user_attrs['index']:>3}]"
+
+                # We don't directly use the trial.values here since we need to show the
+                # CLI-formatted versions, which are stored in the trial's user attributes.
+                score_parts: list[str] = []
+                for score in trial.user_attrs["scores"]:
+                    name = score["name"]
+                    value = Text.from_markup(score["score"]["rich_display"]).plain
+                    score_parts.append(f"{name}: {value}")
+
+                return f"{prefix} " + ", ".join(score_parts)
 
             choices = [
-                Choice(
-                    title=(
-                        f"[Trial {trial.user_attrs['index']:>3}] "
-                        f"Refusals: {trial.user_attrs['refusals']:>2}/{len(evaluator.bad_prompts)}, "
-                        f"KL divergence: {trial.user_attrs['kl_divergence']:.4f}"
-                    ),
-                    value=trial,
-                )
-                for trial in best_trials
+                Choice(title=format_trial_title(trial), value=trial)
+                for trial in sorted_trials
             ]
 
             choices.append(
@@ -796,13 +763,10 @@ def run():
             if settings.trial_index is None:
                 print()
                 print(
-                    (
-                        "The following trials resulted in Pareto optimal combinations of refusals and KL divergence. "
-                        "After selecting a trial, you will be able to save the model, upload it to Hugging Face, "
-                        "chat with it to test how well it works, or run standard benchmarks on it. "
-                        "You can return to this menu later to select a different trial. "
-                        "[yellow]Note that KL divergence values above 0.5 usually indicate significant damage to the original model's capabilities.[/]"
-                    )
+                    "The following trials resulted in Pareto optimal combinations of the optimization objectives. "
+                    "After selecting a trial, you will be able to save the model, upload it to Hugging Face, "
+                    "chat with it to test how well it works, or run standard benchmarks on it. "
+                    "You can return to this menu later to select a different trial. "
                 )
 
         while trial_loop_active:
@@ -811,18 +775,11 @@ def run():
                 trial_loop_active = False
 
             if reproduction_mode:
-                parameters = reproduction_information["parameters"]
-                metrics = reproduction_information["metrics"]
-
                 trial = create_trial(
                     values=[],
                     user_attrs={
-                        "direction_index": parameters["direction_index"],
-                        "parameters": parameters["abliteration_parameters"],
-                        "kl_divergence": metrics["kl_divergence"],
-                        "refusals": metrics["refusals"],
-                        "base_refusals": metrics["base_refusals"],
-                        "n_bad_prompts": metrics["n_bad_prompts"],
+                        "parameters": reproduction_information["parameters"],
+                        "scores": reproduction_information["scores"],
                     },
                 )
 
@@ -835,7 +792,7 @@ def run():
                 trial = ask_if_unset(
                     None
                     if settings.trial_index is None
-                    else best_trials[settings.trial_index],
+                    else sorted_trials[settings.trial_index],
                     questionary.select(
                         "Which trial do you want to use?",
                         choices=choices,
@@ -891,24 +848,21 @@ def run():
                 )
 
             print("* Parameters:")
-            for name, value in get_trial_parameters(trial).items():
+            for name, value in modifier.render_trial_parameters(trial).items():
                 print(f"  * {name} = [bold]{value}[/]")
 
             # Per https://github.com/huggingface/peft/issues/868#issuecomment-1820642893
             # once a LoRA is merged it's expected to be empty. Provide a utility function
             # to restore the previous LoRA-ified state.
             def reset_trial_model():
+                ctx = Context(settings=settings, model=model)
                 print("* Resetting model...")
-                model.reset_model()
-                print("* Abliterating...")
-                model.abliterate(
-                    refusal_directions,
-                    trial.user_attrs["direction_index"],
-                    {
-                        k: AbliterationParameters(**v)
-                        for k, v in trial.user_attrs["parameters"].items()
-                    },
+                modifier.reset_model(ctx)
+                print(f"* Modifying model using {modifier_name}...")
+                parameters = modifier.parameters_class.from_dict(
+                    trial.user_attrs["parameters"]
                 )
+                modifier.modify_model(ctx, parameters)
 
             reset_trial_model()
 
@@ -1002,7 +956,7 @@ def run():
 
                             print(f"Model saved to [bold]{save_directory}[/].")
 
-                            if reproduction_mode and verify_hashes:
+                            if reproduction_mode:
                                 print("Verifying hashes of weight files...")
 
                                 for (
@@ -1088,29 +1042,36 @@ def run():
                                 continue
 
                             # Reproducibility requires that the model and all datasets
-                            # are available on the Hugging Face Hub (not local paths).
-                            datasets = [
-                                settings.good_prompts.dataset,
-                                settings.bad_prompts.dataset,
-                                settings.good_evaluation_prompts.dataset,
-                                settings.bad_evaluation_prompts.dataset,
+                            # are available on the Hugging Face Hub (not local paths),
+                            # that all datasets are pinned to a commit (an unpinned
+                            # dataset was likely loaded from a local cache), and that
+                            # only built-in plugins are used (external plugins cannot
+                            # be resolved when reproducing).
+                            dataset_specifications: list[DatasetSpecification] = [
+                                *evaluator.get_dataset_specifications(),
+                                *modifier.get_dataset_specifications(),
                             ]
                             is_reproducible = (
                                 is_hf_path(settings.model)
-                                and all(is_hf_path(dataset) for dataset in datasets)
+                                and all(
+                                    is_dataset_specification_reproducible(specification)
+                                    for specification in dataset_specifications
+                                )
+                                and evaluator.all_scorers_reproducible()
+                                and evaluator.all_scorers_builtin()
+                                and modifier.reproducible
+                                and is_builtin_plugin(modifier_entry.config.plugin)
                                 and not reproduction_mode
                             )
 
                             if is_reproducible:
                                 if settings.upload_reproducibility_information is None:
                                     print(
-                                        (
-                                            "Heretic can add information to the repository that allows others to reproduce the model. "
-                                            "This is optional, but valuable to the community as both a learning tool and to preserve computational work already done. "
-                                            "Guaranteeing reproducibility requires basic system information (Python and OS version, CPU and GPU/accelerator info) "
-                                            "as tensor operations can give different results in different system environments. "
-                                            "[bold]The information does not include any file system paths or other private data.[/]"
-                                        )
+                                        "Heretic can add information to the repository that allows others to reproduce the model. "
+                                        "This is optional, but valuable to the community as both a learning tool and to preserve computational work already done. "
+                                        "Guaranteeing reproducibility requires basic system information (Python and OS version, CPU and GPU/accelerator info) "
+                                        "as tensor operations can give different results in different system environments. "
+                                        "[bold]The information does not include any file system paths or other private data.[/]"
                                     )
 
                                 reproducibility_information = ask_if_unset(
@@ -1142,7 +1103,7 @@ def run():
                             if strategy == ExportStrategy.ADAPTER:
                                 print("Uploading LoRA adapter...")
                                 model.model.push_to_hub(
-                                    repo_id,
+                                    repo_id,  # ty: ignore[invalid-argument-type]
                                     private=private,
                                     max_shard_size=settings.max_shard_size,
                                     token=token,
@@ -1151,7 +1112,7 @@ def run():
                                 print("Uploading merged model...")
                                 merged_model = model.get_merged_model()
                                 merged_model.push_to_hub(
-                                    repo_id,
+                                    repo_id,  # ty: ignore[invalid-argument-type]
                                     private=private,
                                     max_shard_size=settings.max_shard_size,
                                     token=token,
@@ -1194,9 +1155,16 @@ def run():
                                 card.data.tags.append("abliterated")
                                 if reproducibility_information != "none":
                                     card.data.tags.append("reproducible")
+
+                                # Must be a Hugging Face Hub repository ID,
+                                # so local paths are excluded.
+                                if is_hf_path(settings.model):
+                                    card.data.base_model = settings.model
+
                                 card.text = (
                                     get_readme_intro(
                                         settings,
+                                        modifier,
                                         trial,
                                         reproducibility_information != "none",
                                     )
@@ -1215,6 +1183,7 @@ def run():
                                     upload_reproduce_folder(
                                         repo_id,
                                         settings,
+                                        dataset_specifications,
                                         token,
                                         checkpoint_path=study_checkpoint_file,
                                         trial=trial,
@@ -1227,7 +1196,7 @@ def run():
 
                             print(f"Model uploaded to [bold]{repo_id}[/].")
 
-                            if reproduction_mode and verify_hashes:
+                            if reproduction_mode:
                                 print("Verifying hashes of weight files...")
 
                                 api = HfApi()
@@ -1338,7 +1307,7 @@ def run():
                             benchmark_original_model = scope == "Benchmark both models"
 
                             hflm = HFLM(
-                                pretrained=model.model,  # ty:ignore[invalid-argument-type]
+                                pretrained=model.model,
                                 tokenizer=model.tokenizer,  # ty:ignore[invalid-argument-type]
                                 batch_size="auto",
                             )
