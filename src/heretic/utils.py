@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os
@@ -11,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import version
 from pathlib import Path
-from typing import TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import huggingface_hub
 import tomli_w
@@ -22,12 +24,13 @@ from datasets.download.download_manager import DownloadMode
 from datasets.utils.info_utils import VerificationMode
 from huggingface_hub.utils import validate_repo_id
 from optuna import Trial
+from optuna.study import StudyDirection
 from optuna.trial import FrozenTrial
 from psutil import Process
 from questionary import Question
 from rich.console import Console
 
-from .config import DatasetSpecification, Settings
+from .config import DatasetSpecification, Settings, SingleDatasetSpecification
 from .system import (
     get_accelerator_info_dict,
     get_cpu_info_dict,
@@ -37,10 +40,39 @@ from .system import (
     is_xpu_available,
 )
 
+if TYPE_CHECKING:
+    from .modifier import Modifier
+
+
 T = TypeVar("T")
 
 
 print = Console(highlight=False).print
+
+
+def deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """
+    Recursively merge two dicts.
+
+    Values from `override` take precedence. Nested dicts are merged recursively.
+    """
+    merged: dict[str, Any] = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge_dicts(merged[key], value)  # type: ignore[arg-type]
+        else:
+            merged[key] = value
+    return merged
+
+
+def parse_study_direction(optimization: str) -> StudyDirection:
+    """
+    Converts the optimization value stored as a `str` to the
+    `StudyDirection` object required by Optuna.
+    """
+    if optimization == "none":
+        return StudyDirection.NOT_SET
+    return StudyDirection[optimization.upper()]
 
 
 def print_memory_usage():
@@ -137,9 +169,9 @@ def get_split_slice(split_str: str, length: int) -> tuple[int, int]:
     return absolute_instruction.from_, absolute_instruction.to
 
 
-def load_prompts(
+def _load_prompts_single(
     settings: Settings,
-    specification: DatasetSpecification,
+    specification: SingleDatasetSpecification,
 ) -> list[Prompt]:
     path = specification.dataset
     split_str = specification.split
@@ -164,8 +196,23 @@ def load_prompts(
             raise ValueError(f'The "column" field is required for datasets: {path}')
 
         if is_hf_path(path):
+            # Pin to the latest commit if not already set, so the exact dataset
+            # version is recorded for reproducibility.
+            if specification.commit is None:
+                try:
+                    specification.commit = huggingface_hub.dataset_info(path).sha
+                except Exception as error:
+                    # Fetching the commit hash requires internet access, but the
+                    # dataset itself may be fully cached locally. Proceed without
+                    # pinning; an unpinned dataset disables the reproducibility
+                    # offer during upload.
+                    print(
+                        f"[yellow]Warning: Could not fetch the latest commit hash for dataset [bold]{path}[/] ({error}). "
+                        "The dataset version will not be pinned.[/]"
+                    )
             dataset = load_dataset(
                 path,
+                name=specification.config,
                 revision=specification.commit,
                 split=split_str,
             )
@@ -183,6 +230,7 @@ def load_prompts(
             # Path should be a local directory.
             dataset = load_dataset(
                 path,
+                name=specification.config,
                 split=split_str,
                 # Don't require the number of examples (lines) per split to be pre-defined.
                 verification_mode=VerificationMode.NO_CHECKS,
@@ -213,27 +261,51 @@ def load_prompts(
     ]
 
 
+def load_prompts(
+    settings: Settings,
+    specification: DatasetSpecification,
+) -> list[Prompt]:
+    if isinstance(specification, SingleDatasetSpecification):
+        return _load_prompts_single(settings, specification)
+    else:
+        return [
+            prompt
+            for single_specification in specification
+            for prompt in _load_prompts_single(settings, single_specification)
+        ]
+
+
+def format_dataset_specification(specification: DatasetSpecification) -> str:
+    if isinstance(specification, SingleDatasetSpecification):
+        return specification.dataset
+    else:
+        return (
+            "\\["
+            + ", ".join(
+                single_specification.dataset for single_specification in specification
+            )
+            + "]"
+        )
+
+
+def is_dataset_specification_reproducible(specification: DatasetSpecification) -> bool:
+    if isinstance(specification, SingleDatasetSpecification):
+        return is_hf_path(specification.dataset) and specification.commit is not None
+    else:
+        return all(
+            is_hf_path(single_specification.dataset)
+            and single_specification.commit is not None
+            for single_specification in specification
+        )
+
+
 def batchify(items: list[T], batch_size: int) -> list[list[T]]:
     return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
 
 
-def get_trial_parameters(trial: Trial | FrozenTrial) -> dict[str, str]:
-    params = {}
-
-    direction_index = trial.user_attrs["direction_index"]
-    params["direction_index"] = (
-        "per layer" if (direction_index is None) else f"{direction_index:.2f}"
-    )
-
-    for component, parameters in trial.user_attrs["parameters"].items():
-        for name, value in parameters.items():
-            params[f"{component}.{name}"] = f"{value:.2f}"
-
-    return params
-
-
 def get_readme_intro(
     settings: Settings,
+    modifier: Modifier[Any],
     trial: Trial | FrozenTrial,
     contains_reproducibility_information: bool,
 ) -> str:
@@ -242,6 +314,25 @@ def get_readme_intro(
     else:
         # Hide the path, which may contain private information.
         model_link = "a model"
+
+    scores_raw = trial.user_attrs["scores"]
+    scores_by_name: dict[str, dict[str, Any]] = {}
+    score_names: list[str] = []
+    for score in scores_raw:
+        name = score["name"]
+        scores_by_name[name] = score
+        score_names.append(name)
+
+    score_rows = "\n".join(
+        [
+            (
+                f"| **{name}** | "
+                f"{scores_by_name[name]['score']['md_display']} | "
+                f"{scores_by_name[name]['baseline']['md_display']} |"
+            )
+            for name in score_names
+        ]
+    )
 
     if contains_reproducibility_information:
         reproducibility_instructions = """
@@ -257,7 +348,7 @@ def get_readme_intro(
         model_link
     }, made using [Heretic](https://heretic-project.org) v{version("heretic-llm")}
 {reproducibility_instructions}
-## Abliteration parameters
+## {modifier.modifier_name} parameters
 
 | Parameter | Value |
 | :-------- | :---: |
@@ -265,7 +356,7 @@ def get_readme_intro(
         chr(10).join(
             [
                 f"| **{name}** | {value} |"
-                for name, value in get_trial_parameters(trial).items()
+                for name, value in modifier.render_trial_parameters(trial).items()
             ]
         )
     }
@@ -274,10 +365,7 @@ def get_readme_intro(
 
 | Metric | This model | Original model ({model_link}) |
 | :----- | :--------: | :---------------------------: |
-| **KL divergence** | {trial.user_attrs["kl_divergence"]:.4f} | 0 *(by definition)* |
-| **Refusals** | {trial.user_attrs["refusals"]}/{trial.user_attrs["n_bad_prompts"]} | {
-        trial.user_attrs["base_refusals"]
-    }/{trial.user_attrs["n_bad_prompts"]} |
+{score_rows}
 
 -----
 
@@ -317,6 +405,7 @@ def format_hf_link(
 
 def generate_reproduce_readme(
     settings: Settings,
+    dataset_specifications: list[DatasetSpecification],
     checkpoint_filename: str,
     trial: Trial | FrozenTrial,
     include_system_information: bool,
@@ -433,6 +522,38 @@ def generate_reproduce_readme(
                 f" --index-url https://download.pytorch.org/whl/{suffix}"
             )
 
+    formatted_datasets = set()
+    for specification in dataset_specifications:
+        if isinstance(specification, SingleDatasetSpecification):
+            formatted_datasets.add(
+                format_hf_link(
+                    specification.dataset,
+                    specification.commit,
+                    is_dataset=True,
+                )
+            )
+        else:
+            for single_specification in specification:
+                formatted_datasets.add(
+                    format_hf_link(
+                        single_specification.dataset,
+                        single_specification.commit,
+                        is_dataset=True,
+                    )
+                )
+    dataset_lines = "\n".join(
+        f"- {formatted_dataset}" for formatted_dataset in sorted(formatted_datasets)
+    )
+
+    trial_scores = trial.user_attrs["scores"]
+    score_lines = "\n".join(
+        (
+            f"- **{score['name']}:** {score['score']['md_display']}"
+            f" (baseline: {score['baseline']['md_display']})"
+        )
+        for score in trial_scores
+    )
+
     return f"""# Reproduction guide
 
 This directory contains the necessary information and assets to reproduce the results obtained during this Heretic run.{heterogeneous_warning}{origin_warning}
@@ -443,16 +564,12 @@ This directory contains the necessary information and assets to reproduce the re
 
 ## Datasets
 
-- **Good prompts:** {format_hf_link(settings.good_prompts.dataset, settings.good_prompts.commit, is_dataset=True)}
-- **Bad prompts:** {format_hf_link(settings.bad_prompts.dataset, settings.bad_prompts.commit, is_dataset=True)}
-- **Good evaluation prompts:** {format_hf_link(settings.good_evaluation_prompts.dataset, settings.good_evaluation_prompts.commit, is_dataset=True)}
-- **Bad evaluation prompts:** {format_hf_link(settings.bad_evaluation_prompts.dataset, settings.bad_evaluation_prompts.commit, is_dataset=True)}
+{dataset_lines}
 
 ## Selected trial
 
 - **Trial number:** {trial.user_attrs["index"]}
-- **KL divergence:** {trial.user_attrs["kl_divergence"]:.6f}
-- **Refusals:** {trial.user_attrs["refusals"]}/{trial.user_attrs["n_bad_prompts"]}
+{score_lines}
 
 {system_report}## Environment
 
@@ -502,7 +619,8 @@ def generate_reproduce_json(
     version_info = get_heretic_version_info()
 
     data = {
-        "version": "2",  # Version number of the reproduce.json file format, to allow for future changes.
+        # Version 4: plugin-based schema with generic parameters and scores.
+        "version": "4",
         "timestamp": timestamp,
         "system": None,  # Defined here to preserve insertion order.
         "environment": {
@@ -515,16 +633,8 @@ def generate_reproduce_json(
             "requirements": get_requirements_dict(),
         },
         "settings": settings.model_dump(),
-        "parameters": {
-            "direction_index": trial.user_attrs["direction_index"],
-            "abliteration_parameters": trial.user_attrs["parameters"],
-        },
-        "metrics": {
-            "kl_divergence": trial.user_attrs["kl_divergence"],
-            "refusals": trial.user_attrs["refusals"],
-            "base_refusals": trial.user_attrs["base_refusals"],
-            "n_bad_prompts": trial.user_attrs["n_bad_prompts"],
-        },
+        "parameters": trial.user_attrs["parameters"],
+        "scores": trial.user_attrs["scores"],
         "hashes": uploaded_model_hashes,
     }
 
@@ -571,6 +681,7 @@ def get_file_sha256(file_path: str | Path) -> str:
 def create_reproduce_folder(
     path: Path,
     settings: Settings,
+    dataset_specifications: list[DatasetSpecification],
     checkpoint_path: str | Path,
     trial: Trial | FrozenTrial,
     uploaded_model_hashes: dict[str, str],
@@ -583,15 +694,6 @@ def create_reproduce_folder(
 
     # Fetch commit hash for the base model.
     settings.model_commit = huggingface_hub.model_info(settings.model).sha
-
-    # Fetch commit hashes for all HF datasets to ensure reproducibility.
-    for spec in [
-        settings.good_prompts,
-        settings.bad_prompts,
-        settings.good_evaluation_prompts,
-        settings.bad_evaluation_prompts,
-    ]:
-        spec.commit = huggingface_hub.dataset_info(spec.dataset).sha
 
     # Strip microseconds and timezone for a clean format.
     timestamp = (
@@ -628,6 +730,7 @@ def create_reproduce_folder(
     (reproduce_dir / "README.md").write_text(
         generate_reproduce_readme(
             settings,
+            dataset_specifications,
             checkpoint_filename,
             trial,
             include_system_information=include_system_information,
@@ -644,6 +747,7 @@ def create_reproduce_folder(
 def upload_reproduce_folder(
     repo_id: str,
     settings: Settings,
+    dataset_specifications: list[DatasetSpecification],
     token: str,
     checkpoint_path: str | Path,
     trial: Trial | FrozenTrial,
@@ -672,6 +776,7 @@ def upload_reproduce_folder(
         create_reproduce_folder(
             tmp_path,
             settings,
+            dataset_specifications,
             checkpoint_path=checkpoint_path,
             trial=trial,
             uploaded_model_hashes=uploaded_model_hashes,
